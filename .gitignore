@@ -1,0 +1,26 @@
+# Dependencies and generated frontend
+node_modules/
+dist/
+coverage/
+
+# Local user data — never commit
+.local-data/
+backups/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+*.userdb/
+.weasel-toolbox-managed.json
+weasel_toolbox_*.txt
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db

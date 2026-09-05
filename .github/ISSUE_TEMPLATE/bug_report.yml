@@ -1,0 +1,48 @@
+name: 错误报告
+description: 报告可复现的问题，请勿上传个人词库或备份
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "请先删除截图和日志中的姓名、地址、电话、完整路径及词库正文。"
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本
+      placeholder: 例如 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows 与小狼毫版本
+      placeholder: 例如 Windows 11 / Weasel 0.17
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 使用虚构测试词，不要填写真实个人内容。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已确认内容不包含个人词库、真实地址、电话、姓名、完整用户路径、令牌或备份文件。
+          required: true
