@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { createServer as createViteServer } from 'vite';
 import { Store, validateDraft } from './lib/core.mjs';
 import { discover } from './lib/discovery.mjs';
 import { deleteBackup, deployDrafts, listBackups, restoreManagedBackup, setBackupPinned } from './lib/rime-writer.mjs';
@@ -13,8 +12,12 @@ const store=new Store(path.join(dataDir,'toolbox.sqlite'));
 let detection=await discover();store.event({code:'DISCOVERY_OK',count:detection.schemas.length,details:{total:detection.schemas.length,schemaIds:detection.schemas.map(item=>item.id)}});
 const token=randomBytes(32).toString('hex');
 const port=Number(process.env.TOOLBOX_PORT || 43187);const host=`127.0.0.1:${port}`;
-const vite=await createViteServer({root,server:{middlewareMode:true,hmr:false},appType:'custom'}).catch(()=>null);
+const staticMode=process.env.TOOLBOX_STATIC==='1';
+const vite=staticMode?null:await import('vite').then(({createServer})=>createServer({root,server:{middlewareMode:true,hmr:false},appType:'custom'})).catch(()=>null);
+const distRoot=path.join(root,'dist');
+const mimeTypes={'.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.json':'application/json; charset=utf-8'};
 function reply(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data));}
+async function serveDist(pathname,res){let decoded;try{decoded=decodeURIComponent(pathname)}catch{return false}const target=path.resolve(distRoot,decoded.replace(/^\/+/,''));if(!target.startsWith(path.resolve(distRoot)+path.sep))return false;try{const stat=await fs.stat(target);if(!stat.isFile())return false;res.writeHead(200,{'Content-Type':mimeTypes[path.extname(target).toLowerCase()]||'application/octet-stream','Cache-Control':pathname.startsWith('/assets/')?'public, max-age=31536000, immutable':'no-cache','X-Content-Type-Options':'nosniff'});res.end(await fs.readFile(target));return true}catch{return false}}
 const messages={INVALID_TEXT:'内容须为不超过500字的单行文本',INVALID_CODE:'编码须为小写字母，可含空格或拼音分隔符',INVALID_SCHEMA:'请选择有效输入方案',INVALID_ORDER:'排序必须为1–999',INVALID_ID:'草稿编号无效',NOT_FOUND:'记录不存在或状态已改变',DUPLICATE:'相同草稿已存在',RIME_NOT_READY:'尚未确认可写入的小狼毫目录',NO_DRAFTS:'没有需要同步的记录',UNKNOWN_SCHEMA:'草稿包含已停用或未知的输入方案',DEPLOYER_NOT_FOUND:'没有找到小狼毫部署程序',WRITE_BUSY:'另一个写入或恢复操作正在进行',CONFIG_CONFLICT:'目标方案已有自定义配置，工具不会自动覆盖',TARGET_CONFLICT:'目标短语文件已存在但不归本工具管理',EXTERNAL_CHANGE:'工具管理的配置已被外部修改，请先处理冲突',MANIFEST_INVALID:'工具写入清单损坏，已停止操作',DEPLOY_VERIFY_FAILED:'重新部署完成，但配置验证未通过',BACKUP_INVALID:'备份不存在或清单无效',BACKUP_UNVERIFIED:'旧备份缺少校验值，不能自动恢复',BACKUP_DAMAGED:'备份文件校验失败，已停止恢复',RESTORE_VERIFY_FAILED:'恢复后配置验证未通过'};
 const deployErrors=new Set(['RIME_NOT_READY','NO_DRAFTS','UNKNOWN_SCHEMA','DEPLOYER_NOT_FOUND','WRITE_BUSY','CONFIG_CONFLICT','TARGET_CONFLICT','EXTERNAL_CHANGE','MANIFEST_INVALID','DEPLOY_VERIFY_FAILED']);
 const restoreErrors=new Set(['BACKUP_INVALID','BACKUP_UNVERIFIED','BACKUP_DAMAGED','RESTORE_VERIFY_FAILED']);
@@ -62,7 +65,8 @@ const server=http.createServer(async(req,res)=>{
       reply(res,404,{error:'NOT_FOUND'});
     }catch(e){if(!e.eventLogged)store.event({code:deployErrors.has(e.message)?'DEPLOY_FAILED':restoreErrors.has(e.message)?'RESTORE_FAILED':'INTERNAL_ERROR',details:{errorCode:e.message}});reply(res,400,{error:messages[e.message]||'操作未完成，请检查输入或日志'});}return;
   }
-  if(url.pathname==='/'){let html=await fs.readFile(path.join(root,'index.html'),'utf8');html=html.replace('__TOKEN__',token);if(vite)html=await vite.transformIndexHtml(req.url,html);res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Frame-Options':'DENY'});res.end(html);return;}
+  if(url.pathname==='/'){let html=await fs.readFile(path.join(staticMode?distRoot:root,'index.html'),'utf8');html=html.replace('__TOKEN__',token);if(vite)html=await vite.transformIndexHtml(req.url,html);res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Frame-Options':'DENY'});res.end(html);return;}
+  if(staticMode){if(!await serveDist(url.pathname,res)){res.writeHead(404);res.end();}return;}
   if(vite)vite.middlewares(req,res,()=>{res.writeHead(404);res.end();});else{res.writeHead(503);res.end('Development dependencies unavailable');}
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Toolbox ready: http://${host}`));
