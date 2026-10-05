@@ -1,14 +1,14 @@
 param(
-  [string]$Archive = (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\WeaselToolbox-Portable-v0.3.1-win-x64.zip'),
+  [string]$Archive = (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\WeaselToolbox-Portable-v0.4.1-win-x64.zip'),
   [int]$Port = 43188
 )
 
 $ErrorActionPreference = 'Stop'
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('weasel-toolbox-smoke-' + [guid]::NewGuid().ToString('N'))
+$testRoot = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts') ('weasel-toolbox-smoke-' + [guid]::NewGuid().ToString('N'))
 $process = $null
 
 function Assert-SafeSmokePath([string]$PathValue) {
-  $tempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+  $tempPrefix = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts')).TrimEnd('\') + '\'
   $target = [IO.Path]::GetFullPath($PathValue)
   if (-not $target.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase) -or
       -not ([IO.Path]::GetFileName($target)).StartsWith('weasel-toolbox-smoke-')) {

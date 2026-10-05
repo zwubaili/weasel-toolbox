@@ -5,69 +5,199 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Store, validateDraft } from './lib/core.mjs';
 import { discover } from './lib/discovery.mjs';
-import { deleteBackup, deployDrafts, listBackups, restoreManagedBackup, setBackupPinned } from './lib/rime-writer.mjs';
-const root=path.dirname(fileURLToPath(import.meta.url));
-const dataDir=path.join(root,'.local-data');await fs.mkdir(dataDir,{recursive:true});
-const store=new Store(path.join(dataDir,'toolbox.sqlite'));
-let detection=await discover();store.event({code:'DISCOVERY_OK',count:detection.schemas.length,details:{total:detection.schemas.length,schemaIds:detection.schemas.map(item=>item.id)}});
-const token=randomBytes(32).toString('hex');
-const port=Number(process.env.TOOLBOX_PORT || 43187);const host=`127.0.0.1:${port}`;
-const staticMode=process.env.TOOLBOX_STATIC==='1';
-const vite=staticMode?null:await import('vite').then(({createServer})=>createServer({root,server:{middlewareMode:true,hmr:false},appType:'custom'})).catch(()=>null);
-const distRoot=path.join(root,'dist');
-const mimeTypes={'.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.json':'application/json; charset=utf-8'};
+import * as writer from './lib/rime-writer.mjs';
+import { exportRecords, parseImport, previewImport, commitImport, recoverRecords } from './lib/transfer.mjs';
+import { processAlive, readOptional, writeJson } from './lib/durable.mjs';
+import { listRecordBackups, restoreRecordBackup } from './lib/record-backups.mjs';
+
+const defaultRoot=path.dirname(fileURLToPath(import.meta.url));
+const equalDir=(a,b)=>!!a&&!!b&&path.resolve(a).toLowerCase()===path.resolve(b).toLowerCase();
+const messages={
+ RECORD_LIMIT:'本地记录上限为10000条（含待删除项），请先同步删除或减少导入数量',
+ INVALID_DRAFT:'请选择常用词或快捷短语',INVALID_TEXT:'内容须为不超过500字的单行文本',INVALID_CODE:'编码须为小写字母，可含空格或拼音分隔符',INVALID_SCHEMA:'请选择有效方案；原有失效方案可保留，但写入前需要处理',INVALID_ORDER:'排序必须为1–999，同编码候选可能已满',INVALID_ID:'记录编号无效',NOT_FOUND:'记录不存在或状态已改变',DUPLICATE:'相同记录已存在',
+ RIME_NOT_READY:'未确认可用的输入法，请在更新完成后重新检测',NO_DRAFTS:'没有需要同步的记录或受管文件',UNKNOWN_SCHEMA:'记录含有已停用的方案，请修改适用方案后再同步',DEPLOYER_NOT_FOUND:'未找到部署程序，请等待更新完成并重新检测',WRITE_BUSY:'正在执行其他操作，请稍后重试',
+ CONFIG_CONFLICT:'此方案已有其他自定义配置，已停止覆盖',TARGET_CONFLICT:'目标文件不是可安全覆盖的受管文件',EXTERNAL_CHANGE:'配置被外部修改，已保留现场，请核对后处理',MANIFEST_INVALID:'管理清单损坏，已停止写入',DEPLOY_VERIFY_FAILED:'输入法配置验证失败，请检查恢复提示',
+ BACKUP_INVALID:'备份清单无效',BACKUP_UNVERIFIED:'旧备份缺少校验值，不能自动恢复',BACKUP_DAMAGED:'备份校验失败，已停止恢复',BACKUP_PROTECTED:'此备份用于未完成操作，暂不能删除',RECOVERY_REQUIRED:'上次操作未完成，请先恢复到操作前',RECOVERY_INVALID:'操作记录损坏或缺失，请保留备份并人工检查',
+ TARGET_CHANGED:'用户目录已变化，请先确认新的目标；历史恢复只允许回到原目录',
+ IMPORT_INVALID:'请选择本工具导出的记录 JSON 文件（最多10000条）',IMPORT_UNRESOLVED:'请逐项处理差异后确认合并',IMPORT_STALE:'本地记录或输入方案已变化，请重新预览',IMPORT_CONFLICT:'导入项之间存在重复或相互覆盖，请保留其中一项后再确认',BODY_TOO_LARGE:'文件或请求过大（导入上限5MB）'
+};
+const mime={'.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon','.json':'application/json; charset=utf-8'};
 function reply(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data));}
-async function serveDist(pathname,res){let decoded;try{decoded=decodeURIComponent(pathname)}catch{return false}const target=path.resolve(distRoot,decoded.replace(/^\/+/,''));if(!target.startsWith(path.resolve(distRoot)+path.sep))return false;try{const stat=await fs.stat(target);if(!stat.isFile())return false;res.writeHead(200,{'Content-Type':mimeTypes[path.extname(target).toLowerCase()]||'application/octet-stream','Cache-Control':pathname.startsWith('/assets/')?'public, max-age=31536000, immutable':'no-cache','X-Content-Type-Options':'nosniff'});res.end(await fs.readFile(target));return true}catch{return false}}
-const messages={INVALID_TEXT:'内容须为不超过500字的单行文本',INVALID_CODE:'编码须为小写字母，可含空格或拼音分隔符',INVALID_SCHEMA:'请选择有效输入方案',INVALID_ORDER:'排序必须为1–999',INVALID_ID:'草稿编号无效',NOT_FOUND:'记录不存在或状态已改变',DUPLICATE:'相同草稿已存在',RIME_NOT_READY:'尚未确认可写入的小狼毫目录',NO_DRAFTS:'没有需要同步的记录',UNKNOWN_SCHEMA:'草稿包含已停用或未知的输入方案',DEPLOYER_NOT_FOUND:'没有找到小狼毫部署程序',WRITE_BUSY:'另一个写入或恢复操作正在进行',CONFIG_CONFLICT:'目标方案已有自定义配置，工具不会自动覆盖',TARGET_CONFLICT:'目标短语文件已存在但不归本工具管理',EXTERNAL_CHANGE:'工具管理的配置已被外部修改，请先处理冲突',MANIFEST_INVALID:'工具写入清单损坏，已停止操作',DEPLOY_VERIFY_FAILED:'重新部署完成，但配置验证未通过',BACKUP_INVALID:'备份不存在或清单无效',BACKUP_UNVERIFIED:'旧备份缺少校验值，不能自动恢复',BACKUP_DAMAGED:'备份文件校验失败，已停止恢复',RESTORE_VERIFY_FAILED:'恢复后配置验证未通过'};
-const deployErrors=new Set(['RIME_NOT_READY','NO_DRAFTS','UNKNOWN_SCHEMA','DEPLOYER_NOT_FOUND','WRITE_BUSY','CONFIG_CONFLICT','TARGET_CONFLICT','EXTERNAL_CHANGE','MANIFEST_INVALID','DEPLOY_VERIFY_FAILED']);
-const restoreErrors=new Set(['BACKUP_INVALID','BACKUP_UNVERIFIED','BACKUP_DAMAGED','RESTORE_VERIFY_FAILED']);
-const server=http.createServer(async(req,res)=>{
-  if(req.headers.host!==host){reply(res,403,{error:'HOST_DENIED'});return;}
-  const url=new URL(req.url,`http://${host}`);
-  if(url.pathname.startsWith('/api/')){
-    if(req.headers['x-toolbox-token']!==token){reply(res,403,{error:'TOKEN_REQUIRED'});return;}
-    if(req.headers.origin && req.headers.origin!==`http://${host}`){reply(res,403,{error:'ORIGIN_DENIED'});return;}
-    try{
-      if(req.method==='GET' && url.pathname==='/api/state'){reply(res,200,{detection,drafts:store.drafts(),events:store.events(),version:'0.3.0 开发预览',readOnlyRime:false,writeFeature:'fixed_phrase'});return;}
-      if(req.method==='POST' && url.pathname==='/api/refresh'){detection=await discover();store.event({code:'DISCOVERY_OK',count:detection.schemas.length,details:{total:detection.schemas.length,schemaIds:detection.schemas.map(item=>item.id)}});reply(res,200,{ok:true});return;}
-      if(req.method==='GET' && url.pathname==='/api/logs/export'){store.event({code:'EXPORT_DONE'});reply(res,200,{app:'Weasel Toolbox',version:'0.1.0-dev',events:store.events()});return;}
-      if(req.method==='GET' && url.pathname==='/api/backups'){const backups=await listBackups(path.join(dataDir,'backups'));reply(res,200,{backups,totalBytes:backups.reduce((sum,item)=>sum+item.sizeBytes,0),policy:{keepDeploy:20,keepSafety:5}});return;}
-      if(req.method==='POST' && /^\/api\/backups\/[^/]+\/pin$/.test(url.pathname)){
-        let body='';for await(const chunk of req){body+=chunk;if(Buffer.byteLength(body)>1024){reply(res,413,{error:'内容过大'});return;}}
-        const result=await setBackupPinned(path.join(dataDir,'backups'),url.pathname.split('/')[3],Boolean(JSON.parse(body).pinned));reply(res,200,result);return;
-      }
-      if(req.method==='DELETE' && /^\/api\/backups\/[^/]+$/.test(url.pathname)){const result=await deleteBackup(path.join(dataDir,'backups'),url.pathname.split('/')[3]);reply(res,200,result);return;}
-      if(req.method==='POST' && url.pathname==='/api/drafts'){
-        let body='';for await(const chunk of req){body+=chunk;if(Buffer.byteLength(body)>8192){reply(res,413,{error:'内容过大'});return;}}
-        const draft=validateDraft(JSON.parse(body),detection.schemas.map(s=>s.id));store.add(draft);reply(res,201,{ok:true});return;
-      }
-      if(req.method==='PUT' && url.pathname.startsWith('/api/drafts/')){
-        let body='';for await(const chunk of req){body+=chunk;if(Buffer.byteLength(body)>8192){reply(res,413,{error:'内容过大'});return;}}
-        const draft=validateDraft(JSON.parse(body),detection.schemas.map(s=>s.id));store.update(url.pathname.split('/').pop(),draft);reply(res,200,{ok:true});return;
-      }
-      if(req.method==='POST' && url.pathname==='/api/deploy-drafts'){
-        const operationId=randomUUID();const started=Date.now();const all=store.drafts();const active=all.filter(item=>item.status!=='delete_pending');
-        const details={added:all.filter(item=>item.status==='draft').length,modified:all.filter(item=>item.status==='modified').length,deleted:all.filter(item=>item.status==='delete_pending').length,total:all.length,schemaIds:[...new Set(active.flatMap(item=>item.schemaIds))]};
-        store.event({code:'DEPLOY_STARTED',operationId,count:all.length,details});
-        try {
-          if(!all.length)throw new Error('NO_DRAFTS');detection=await discover();
-          const result=await deployDrafts({detection,drafts:active,backupRoot:path.join(dataDir,'backups')});
-          store.markDeployed();store.event({code:'DEPLOY_COMPLETED',operationId,count:result.draftCount,details:{...details,backupId:result.backupId,schemaIds:result.schemas,durationMs:Date.now()-started}});reply(res,200,{...result,changes:details,durationMs:Date.now()-started});return;
-        } catch(e){store.event({code:'DEPLOY_FAILED',operationId,count:all.length,details:{...details,errorCode:e.message,durationMs:Date.now()-started}});e.eventLogged=true;throw e;}
-      }
-      if(req.method==='POST' && /^\/api\/backups\/[^/]+\/restore$/.test(url.pathname)){
-        const backupId=url.pathname.split('/')[3];const operationId=randomUUID();const started=Date.now();store.event({code:'RESTORE_STARTED',operationId,details:{sourceBackupId:backupId}});
-        try {detection=await discover();const result=await restoreManagedBackup({detection,backupRoot:path.join(dataDir,'backups'),backupId});store.markAllPending();store.event({code:'RESTORE_COMPLETED',operationId,details:{sourceBackupId:backupId,backupId:result.safetyBackupId,durationMs:Date.now()-started}});reply(res,200,{...result,durationMs:Date.now()-started});return;}
-        catch(e){store.event({code:'RESTORE_FAILED',operationId,details:{sourceBackupId:backupId,errorCode:e.message,durationMs:Date.now()-started}});e.eventLogged=true;throw e;}
-      }
-      if(req.method==='POST' && /^\/api\/drafts\/[^/]+\/undelete$/.test(url.pathname)){store.restoreDeleted(url.pathname.split('/')[3]);reply(res,200,{ok:true});return;}
-      if(req.method==='DELETE' && url.pathname.startsWith('/api/drafts/')){store.remove(url.pathname.split('/').pop());reply(res,200,{ok:true});return;}
-      reply(res,404,{error:'NOT_FOUND'});
-    }catch(e){if(!e.eventLogged)store.event({code:deployErrors.has(e.message)?'DEPLOY_FAILED':restoreErrors.has(e.message)?'RESTORE_FAILED':'INTERNAL_ERROR',details:{errorCode:e.message}});reply(res,400,{error:messages[e.message]||'操作未完成，请检查输入或日志'});}return;
+async function body(req,limit=8192){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>limit)throw Error('BODY_TOO_LARGE');chunks.push(chunk);}return JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');}
+
+export async function createToolbox({root=defaultRoot,dataDir=path.join(root,'.local-data'),discoverFn=discover,operations={},staticMode=true,port=43187}={}){
+  await fs.mkdir(dataDir,{recursive:true});
+  const instanceFile=path.join(dataDir,'server.lock');
+  const old=await readOptional(instanceFile);
+  if(old){let owner;try{owner=JSON.parse(old);}catch{throw Error('INSTANCE_LOCK_INVALID');}if(processAlive(owner.pid))throw Error('INSTANCE_RUNNING');await fs.unlink(instanceFile);}
+  const instance=await fs.open(instanceFile,'wx');
+  await instance.writeFile(JSON.stringify({pid:process.pid}));await instance.close();
+  const store=new Store(path.join(dataDir,'toolbox.sqlite'));
+  const backupRoot=path.join(dataDir,'backups');
+  const recordBackupRoot=path.join(dataDir,'record-backups');
+  const ops={...writer,...operations};
+  let detection=await discoverFn();
+  if(!store.getSetting('userDir')&&detection.state==='detected')store.setSetting('userDir',detection.userDir);
+  let busy=false;let preview=null;
+  const token=randomBytes(32).toString('hex');
+  const version=JSON.parse(await fs.readFile(path.join(root,'package.json'),'utf8')).version;
+  const vite=staticMode?null:await import('vite').then(({createServer})=>createServer({root,server:{middlewareMode:true,hmr:false},appType:'custom'}));
+  const state=async()=>({
+    detection,drafts:store.drafts(),events:store.events(),version,busy,revision:store.revision(),
+    recovery:busy?{state:'busy',blocked:true}:await ops.inspectRecovery(backupRoot,detection.userDir),
+    targetChanged:detection.state==='detected'&&!equalDir(store.getSetting('userDir'),detection.userDir),
+    acceptedUserDir:store.getSetting('userDir'),readOnlyRime:false,writeFeature:'fixed_phrase'
+  });
+  async function refresh(){detection=await discoverFn();store.event({code:detection.state==='detected'?'DISCOVERY_OK':'DISCOVERY_FAILED',count:detection.schemas.length});}
+  async function requireTarget(){
+    await refresh();
+    if(detection.state!=='detected')throw Error('RIME_NOT_READY');
+    if(!equalDir(store.getSetting('userDir'),detection.userDir))throw Error('TARGET_CHANGED');
   }
-  if(url.pathname==='/'){let html=await fs.readFile(path.join(staticMode?distRoot:root,'index.html'),'utf8');html=html.replace('__TOKEN__',token);if(vite)html=await vite.transformIndexHtml(req.url,html);res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Frame-Options':'DENY'});res.end(html);return;}
-  if(staticMode){if(!await serveDist(url.pathname,res)){res.writeHead(404);res.end();}return;}
-  if(vite)vite.middlewares(req,res,()=>{res.writeHead(404);res.end();});else{res.writeHead(503);res.end('Development dependencies unavailable');}
-});
-server.listen(port,'127.0.0.1',()=>console.log(`Toolbox ready: http://${host}`));
-for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{await vite?.close();store.close();server.close();process.exit(0);});
+  async function loggedRestore(action,prefix='RESTORE'){
+    const operationId=randomUUID();const started=Date.now();
+    store.event({code:prefix+'_STARTED',operationId});
+    try{
+      const result=await action();
+      store.event({code:prefix+'_COMPLETED',operationId,details:{durationMs:Date.now()-started,backupId:result.safetyBackupId,sourceBackupId:result.backupId}});
+      return result;
+    }catch(e){store.event({code:prefix+'_FAILED',operationId,details:{durationMs:Date.now()-started,errorCode:e.message}});throw e;}
+  }
+  async function mutable(action,{recovery=false,allowBlocked=false}={}){
+    if(busy)throw Error('WRITE_BUSY');
+    busy=true;
+    try{
+      if(!recovery&&!allowBlocked){const status=await ops.inspectRecovery(backupRoot,detection.userDir);if(status.blocked)throw Error(status.state==='busy'?'WRITE_BUSY':'RECOVERY_REQUIRED');}
+      return await action();
+    }finally{busy=false;}
+  }
+  const server=http.createServer(async(req,res)=>{
+    const address=server.address();const host='127.0.0.1:'+address.port;
+    try{
+      if(req.headers.host!==host){reply(res,403,{error:'HOST_DENIED'});return;}
+      const url=new URL(req.url,'http://'+host);
+      if(url.pathname.startsWith('/api/')){
+        if(req.headers['x-toolbox-token']!==token){reply(res,403,{error:'TOKEN_REQUIRED'});return;}
+        if(req.headers.origin&&req.headers.origin!=='http://'+host){reply(res,403,{error:'ORIGIN_DENIED'});return;}
+        if(req.method==='GET'){
+          if(url.pathname==='/api/record-backups'){reply(res,200,{backups:await listRecordBackups(recordBackupRoot),revision:store.revision()});return;}
+          if(url.pathname==='/api/state'){reply(res,200,await state());return;}
+          if(url.pathname==='/api/logs/export'){reply(res,200,{app:'Weasel Toolbox',version,events:store.events(true)});return;}
+          if(url.pathname==='/api/records/export'){
+            const kind=url.searchParams.get('kind');if(kind&&!['word','phrase'].includes(kind))throw Error('INVALID_DRAFT');
+            reply(res,200,exportRecords(store,kind));return;
+          }
+          if(url.pathname==='/api/backups'){const backups=await ops.listBackups(backupRoot);reply(res,200,{backups,totalBytes:backups.reduce((n,b)=>n+b.sizeBytes,0),policy:{keepDeploy:20,keepSafety:5}});return;}
+        }
+        if(req.method==='POST'&&url.pathname==='/api/refresh'){await mutable(refresh,{allowBlocked:true});reply(res,200,{ok:true});return;}
+        if(req.method==='POST'&&url.pathname==='/api/records/export'){
+          const result=await mutable(async()=>{
+            const {kind}=await body(req);if(kind&&!['word','phrase'].includes(kind))throw Error('INVALID_DRAFT');
+            const exported=exportRecords(store,kind);const dir=path.join(dataDir,'exports');await fs.mkdir(dir,{recursive:true});
+            const file=path.join(dir,(kind||'all')+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'-'+randomUUID().slice(0,8)+'.json');
+            await writeJson(file,exported);return {ok:true,path:file,count:exported.records.length};
+          },{allowBlocked:true});reply(res,200,result);return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/target/confirm'){
+          await mutable(async()=>{
+            const value=await body(req);await refresh();if(detection.state!=='detected'||!equalDir(value.userDir,detection.userDir))throw Error('TARGET_CHANGED');
+            store.setSetting('userDir',detection.userDir);store.markAllPending();preview=null;
+          });reply(res,200,{ok:true});return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/recovery'){
+          await mutable(()=>loggedRestore(async()=>{await requireTarget();return ops.recoverInterrupted({detection,backupRoot,store});}),{recovery:true});
+          reply(res,200,{ok:true});return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/record-backups/restore'){
+          const result=await mutable(()=>loggedRestore(async()=>{
+            const input=await body(req);
+            const restored=await restoreRecordBackup({store,backupDir:recordBackupRoot,id:input.id,revision:input.revision});preview=null;return restored;
+          },'RECORDS_RESTORE'));
+          reply(res,200,result);return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/import/preview'){
+          const result=await mutable(async()=>{
+            const input=await body(req,5*1024*1024);await refresh();
+            const records=parseImport(input);
+            preview={id:randomUUID(),revision:store.revision(),schemas:detection.schemas.map(s=>s.id).sort(),expires:Date.now()+15*60*1000,rows:previewImport(records,store.drafts(),detection.schemas.map(s=>s.id))};
+            return preview;
+          });reply(res,200,result);return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/records/recover-preview'){
+          const result=await mutable(async()=>{
+            await requireTarget();
+            const found=await recoverRecords(detection.userDir);
+            preview={id:randomUUID(),revision:store.revision(),schemas:detection.schemas.map(s=>s.id).sort(),expires:Date.now()+15*60*1000,rows:previewImport(found.records,store.drafts(),detection.schemas.map(s=>s.id)),warnings:found.warnings,source:'recovery'};
+            return preview;
+          });reply(res,200,result);return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/import/commit'){
+          const result=await mutable(async()=>{
+            const input=await body(req,5*1024*1024);await refresh();
+            if(!preview||input.id!==preview.id||Date.now()>preview.expires||JSON.stringify(preview.schemas)!==JSON.stringify(detection.schemas.map(s=>s.id).sort()))throw Error('IMPORT_STALE');
+            const result=await commitImport({store,preview:preview.rows,decisions:input.decisions,revision:preview.revision,backupDir:path.join(dataDir,'record-backups')});preview=null;return result;
+          });reply(res,200,result);return;
+        }
+        if((req.method==='POST'&&url.pathname==='/api/drafts')||(req.method==='PUT'&&/^\/api\/drafts\/[^/]+$/.test(url.pathname))){
+          await mutable(async()=>{
+            const input=await body(req);const id=url.pathname.split('/').pop();const old=req.method==='PUT'?store.drafts().find(d=>d.id===id):null;
+            const schemas=[...new Set([...detection.schemas.map(s=>s.id),...(old?.schemaIds||[])])];
+            const draft=validateDraft(input,schemas);
+            if(old)store.update(id,draft);else if(req.method==='PUT')throw Error('NOT_FOUND');else store.add(draft);
+          });reply(res,req.method==='POST'?201:200,{ok:true});return;
+        }
+        if(req.method==='DELETE'&&/^\/api\/drafts\/[^/]+$/.test(url.pathname)){
+          await mutable(()=>store.remove(url.pathname.split('/').pop()));reply(res,200,{ok:true});return;
+        }
+        if(req.method==='POST'&&/^\/api\/drafts\/[^/]+\/undelete$/.test(url.pathname)){
+          await mutable(()=>store.restoreDeleted(url.pathname.split('/')[3]));reply(res,200,{ok:true});return;
+        }
+        if(req.method==='POST'&&url.pathname==='/api/deploy-drafts'){
+          const result=await mutable(async()=>{
+            await requireTarget();const all=store.drafts();const active=all.filter(d=>d.status!=='delete_pending');
+            const operationId=randomUUID();const started=Date.now();
+            const details={added:all.filter(d=>d.status==='draft').length,modified:all.filter(d=>d.status==='modified').length,deleted:all.filter(d=>d.status==='delete_pending').length};
+            store.event({code:'DEPLOY_STARTED',operationId,count:all.length,details});
+            try{
+              const result=await ops.deployDrafts({detection,drafts:active,backupRoot,store});
+              store.event({code:'DEPLOY_COMPLETED',operationId,count:result.draftCount,details:{...details,backupId:result.backupId,durationMs:Date.now()-started}});return result;
+            }catch(e){store.event({code:'DEPLOY_FAILED',operationId,details:{errorCode:e.message}});throw e;}
+          });reply(res,200,result);return;
+        }
+        const backupMatch=url.pathname.match(/^\/api\/backups\/([^/]+)(?:\/(restore|pin))?$/);
+        if(backupMatch){
+          const [,id,action]=backupMatch;let result;
+          if(req.method==='POST'&&action==='restore')result=await mutable(()=>loggedRestore(async()=>{
+            await requireTarget();return ops.restoreManagedBackup({detection,backupRoot,backupId:id,store});
+          }));
+          else if(req.method==='POST'&&action==='pin')result=await mutable(async()=>ops.setBackupPinned(backupRoot,id,Boolean((await body(req)).pinned)));
+          else if(req.method==='DELETE'&&!action)result=await mutable(()=>ops.deleteBackup(backupRoot,id));
+          if(result){reply(res,200,result);return;}
+        }
+        reply(res,404,{error:'NOT_FOUND'});return;
+      }
+      if(url.pathname==='/'){
+        let html=await fs.readFile(path.join(root,staticMode?'dist/index.html':'index.html'),'utf8');html=html.replace('__TOKEN__',token);if(vite)html=await vite.transformIndexHtml(req.url,html);
+        res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Frame-Options':'DENY'});res.end(html);return;
+      }
+      if(vite){vite.middlewares(req,res,()=>{res.writeHead(404);res.end();});return;}
+      let decoded;try{decoded=decodeURIComponent(url.pathname);}catch{res.writeHead(400);res.end();return;}
+      const distRoot=path.join(root,'dist');const target=path.resolve(distRoot,decoded.replace(/^\/+/,''));
+      if(!target.startsWith(distRoot+path.sep)||decoded.includes(':')||decoded.includes('\\')){res.writeHead(404);res.end();return;}
+      try{const content=await fs.readFile(target);res.writeHead(200,{'Content-Type':mime[path.extname(target)]||'application/octet-stream','X-Content-Type-Options':'nosniff'});res.end(content);}catch{res.writeHead(404);res.end();}
+    }catch(e){
+      if(!res.headersSent)reply(res,['WRITE_BUSY','RECOVERY_REQUIRED','IMPORT_STALE','TARGET_CHANGED'].includes(e.message)?409:e.message==='BODY_TOO_LARGE'?413:400,{error:messages[e.message]||'操作未完成，请检查输入或日志',code:messages[e.message]?e.message:'INVALID_REQUEST'});
+      else res.destroy();
+    }
+  });
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);}).catch(async e=>{await vite?.close();store.close();await fs.unlink(instanceFile);throw e;});
+  return {server,store,token,port:server.address().port,async close(){
+    if(busy)throw Error('WRITE_BUSY');
+    await vite?.close();await new Promise(resolve=>server.close(resolve));store.close();await fs.unlink(instanceFile);
+  }};
+}
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
+  const app=await createToolbox({staticMode:process.env.TOOLBOX_STATIC==='1',port:Number(process.env.TOOLBOX_PORT||43187),dataDir:process.env.TOOLBOX_DATA_DIR||path.join(defaultRoot,'.local-data')});
+  console.log('Toolbox ready: http://127.0.0.1:'+app.port);
+  for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{try{await app.close();process.exit(0);}catch{console.log('正在完成写入，请稍后退出。');}});
+}

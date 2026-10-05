@@ -7,8 +7,8 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $package = Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json
 $bundleName = "WeaselToolbox-Portable-v$($package.version)-win-x64"
 $artifactRoot = Join-Path $projectRoot 'artifacts'
-$downloadCache = Join-Path ([IO.Path]::GetTempPath()) 'weasel-toolbox-download-cache'
-$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("weasel-toolbox-package-" + [guid]::NewGuid().ToString('N'))
+$downloadCache = Join-Path $projectRoot '.cache\downloads'
+$tempRoot = Join-Path $artifactRoot ("weasel-toolbox-package-" + [guid]::NewGuid().ToString('N'))
 $bundleRoot = Join-Path $tempRoot $bundleName
 $appRoot = Join-Path $bundleRoot 'app'
 $runtimeRoot = Join-Path $bundleRoot 'runtime'
@@ -17,7 +17,7 @@ $archivePath = Join-Path $artifactRoot $archiveName
 $checksumPath = "$archivePath.sha256"
 
 function Assert-SafeTempPath([string]$PathValue) {
-  $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+  $resolvedTemp = [IO.Path]::GetFullPath($artifactRoot).TrimEnd('\') + '\'
   $resolvedTarget = [IO.Path]::GetFullPath($PathValue)
   if (-not $resolvedTarget.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -or
       -not ([IO.Path]::GetFileName($resolvedTarget)).StartsWith('weasel-toolbox-package-')) {
@@ -52,7 +52,9 @@ try {
   if (-not (Test-Path -LiteralPath $downloadedNode)) {
     Invoke-WebRequest -Uri $nodeUrl -OutFile $downloadedNode
   }
-  Invoke-WebRequest -Uri $sumsUrl -OutFile $downloadedSums
+  if (-not (Test-Path -LiteralPath $downloadedSums)) {
+    Invoke-WebRequest -Uri $sumsUrl -OutFile $downloadedSums -TimeoutSec 60
+  }
   $sumLine = Get-Content -LiteralPath $downloadedSums | Where-Object { $_ -match "\s+$([regex]::Escape($nodeArchive))$" } | Select-Object -First 1
   if (-not $sumLine) { throw 'Node.js checksum entry was not found.' }
   $expected = ($sumLine -split '\s+')[0].ToLowerInvariant()

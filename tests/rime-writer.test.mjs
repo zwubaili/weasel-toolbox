@@ -39,7 +39,7 @@ test('部署前备份并写入全部方案，失败时恢复原文件',async()=>
     const table=path.join(f.userDir,'weasel_toolbox_wubi86.txt');
     const original=fs.readFileSync(table,'utf8');
     assert.ok(fs.existsSync(path.join(f.userDir,'wubi86.custom.yaml')));
-    await assert.rejects(()=>deployDrafts({...f,drafts:[{...f.drafts[0],text:'变化'}],runDeployer:async()=>{throw Error('DEPLOY_FAILED')},verify:async()=>{}}),/DEPLOY_FAILED/);
+    await assert.rejects(()=>deployDrafts({...f,drafts:[{...f.drafts[0],text:'变化'}],runDeployer:async()=>{throw Error('DEPLOY_FAILED')},verify:async()=>{}}),/RECOVERY_REQUIRED/);
     assert.equal(fs.readFileSync(table,'utf8'),original);
   } finally { fs.rmSync(f.dir,{recursive:true,force:true}); }
 });
@@ -58,7 +58,7 @@ test('备份可列出并能在校验后恢复到写入前状态',async()=>{
   try {
     const fakeDeploy=async()=>{
       const build=path.join(f.userDir,'build');fs.mkdirSync(build,{recursive:true});
-      for(const schema of f.detection.schemas){const custom=path.join(f.userDir,`${schema.id}.custom.yaml`);fs.writeFileSync(path.join(build,`${schema.id}.schema.yaml`),fs.existsSync(custom)?`table_translator@weasel_toolbox_phrase\nuser_dict: weasel_toolbox_${schema.id}\n`:'engine: {}\n');}
+      for(const schema of f.detection.schemas){const custom=path.join(f.userDir,`${schema.id}.custom.yaml`);fs.writeFileSync(path.join(build,`${schema.id}.schema.yaml`),fs.existsSync(custom)?`engine:\n  translators: [table_translator@weasel_toolbox_phrase]\nweasel_toolbox_phrase:\n  user_dict: weasel_toolbox_${schema.id}\n`:'engine: {}\n');}
     };
     const deployed=await deployDrafts({...f,runDeployer:fakeDeploy,verify:async()=>{}});
     const backups=await listBackups(f.backupRoot);

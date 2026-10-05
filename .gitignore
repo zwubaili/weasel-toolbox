@@ -3,6 +3,7 @@ node_modules/
 dist/
 coverage/
 artifacts/
+.cache/
 
 # Local user data — never commit
 .local-data/
